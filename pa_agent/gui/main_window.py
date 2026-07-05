@@ -1464,8 +1464,12 @@ class MainWindow(QMainWindow):
             # the refresh loop opens its own connection (avoids TV rate-limiting)
             import time as _time
             _time.sleep(1.5)
-        # Stop any existing loop first so we can start fresh
+        # Stop any existing loop first so we can start fresh.
+        # Reset the keep-analysis sentinel so a stale closed-bar ts from a
+        # previous session / interrupted fetch does not immediately fire a
+        # spurious analysis round on the very first frame after reconnect.
         self._stop_refresh_loop()
+        self._keep_analysis_last_closed_ts = None
         self._set_chart_refresh_paused(False)
         self._start_refresh_loop()
 
@@ -1491,6 +1495,9 @@ class MainWindow(QMainWindow):
             return  # no data source — can't start
         logger.info("Auto-starting RefreshLoop triggered by checkbox enable")
         self._stop_refresh_loop()
+        # Reset sentinel so the fresh loop's first frame initialises it correctly
+        # rather than triggering a spurious analysis by comparing against a stale ts.
+        self._keep_analysis_last_closed_ts = None
         self._set_chart_refresh_paused(False)
         self._start_refresh_loop()
 
