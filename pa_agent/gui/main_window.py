@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from typing import Any
 
 from PyQt6.QtCore import QThread, QTimer, pyqtSignal, QObject
@@ -346,6 +347,10 @@ class MainWindow(QMainWindow):
 
         # ── Menu bar ─── 顶层直接触发按钮 + 演示模式下拉 ────────────────────
         menu_bar: QMenuBar = self.menuBar()  # type: ignore[assignment]
+        # macOS 原生菜单栏只认 QMenu 下拉菜单，不认顶层 QAction，
+        # 强制禁用原生菜单栏以保持跨平台一致的按钮式菜单栏体验。
+        if sys.platform == "darwin":
+            menu_bar.setNativeMenuBar(False)
 
         # 1. AI 模型设置 — 点击直接弹对话框（无下拉）
         _ai_model_action = QAction("AI 模型设置", self)
@@ -404,6 +409,10 @@ class MainWindow(QMainWindow):
             _last_ds = normalize_data_source_kind(
                 getattr(_settings.general, "last_data_source", "mt5")
             )
+        # 如果上次保存的数据源不在 UI 可选列表中, 强制回退 MT5
+        _ui_kinds = {k for k, _ in DATA_SOURCE_CHOICES}
+        if _last_ds not in _ui_kinds:
+            _last_ds = "mt5"
         self._active_data_source_kind = _last_ds
 
         ctrl_layout.addWidget(QLabel("数据来源:"))
@@ -484,8 +493,20 @@ class MainWindow(QMainWindow):
         ctrl_layout.addWidget(self._tv_exchange_label)
         ctrl_layout.addWidget(self._tv_exchange_combo)
 
-        # Symbol — editable combo (user can type any MT5 symbol)
-        ctrl_layout.addWidget(QLabel("品种:"))
+        # 品种选择 (仅东方财富期货数据源显示, 两级选择: 品种→合约)
+        self._variety_label = QLabel("品种:")
+        self._variety_combo = QComboBox()
+        self._variety_combo.setMinimumWidth(120)
+        self._variety_combo.setToolTip("选择品种大类, 再在右侧选择具体合约")
+        self._variety_combo.currentIndexChanged.connect(
+            self._on_variety_combo_changed
+        )
+        ctrl_layout.addWidget(self._variety_label)
+        ctrl_layout.addWidget(self._variety_combo)
+
+        # 合约/品种 — editable combo (user can type any symbol)
+        self._symbol_label = QLabel("合约:")
+        ctrl_layout.addWidget(self._symbol_label)
         self._symbol_combo = QComboBox()
         self._symbol_combo.setEditable(True)
         self._symbol_combo.setCurrentText(_last_symbol)
@@ -1075,10 +1096,17 @@ class MainWindow(QMainWindow):
         if line is None:
             return
         kind = self._current_data_source_kind()
+        # 东方财富期货: 两级选择 (品种→合约), 显示品种下拉框, 标签改"合约"
+        is_futures = kind == "eastmoney_futures"
+        self._variety_label.setVisible(is_futures)
+        self._variety_combo.setVisible(is_futures)
+        self._symbol_label.setText("合约:" if is_futures else "品种:")
         if kind == "tradingview":
             line.setPlaceholderText(
                 "A股 6 位 / 港股 1810 / 名称 小米集团；交易所可自动；或 XAUUSD+OANDA"
             )
+        elif kind == "eastmoney_futures":
+            line.setPlaceholderText("选择左侧品种后在此选合约, 或直接输入如 AO2509")
         elif kind in ("akshare", "eastmoney", "tushare"):
             line.setPlaceholderText("A股 6 位代码，如 600519；指数 000300 或 sh000300")
         else:
@@ -1091,6 +1119,13 @@ class MainWindow(QMainWindow):
         data_source = getattr(self._ctx, "data_source", None)
         current = self._symbol_combo.currentText().strip()
         kind = self._current_data_source_kind()
+
+        # 东方财富期货: 两级选择 (品种 → 合约)
+        if kind == "eastmoney_futures" and data_source is not None:
+            self._populate_futures_variety_and_contracts(data_source, current)
+            self._apply_data_source_symbol_placeholder()
+            return
+
         symbols: list[str] = []
         if data_source is not None and getattr(data_source, "_connected", False):
             try:
@@ -1114,6 +1149,78 @@ class MainWindow(QMainWindow):
             self._symbol_combo.setCurrentText(default)
         self._symbol_combo.blockSignals(False)
         self._apply_data_source_symbol_placeholder()
+
+    def _populate_futures_variety_and_contracts(
+        self, data_source: object, current: str
+    ) -> None:
+        """填充期货品种下拉框 + 合约下拉框 (两级选择)."""
+        varieties: list[str] = []
+        try:
+            varieties = list(data_source.list_symbols())  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("list_symbols failed: %s", exc)
+
+        # 1. 品种下拉框
+        self._variety_combo.blockSignals(True)
+        self._variety_combo.clear()
+        self._variety_combo.addItems(varieties)
+        variety_idx = 0
+        if current:
+            cur_code = current.split()[0].upper() if current.split() else ""
+            for i, v in enumerate(varieties):
+                v_code = v.split()[0].upper() if v.split() else ""
+                if v_code and (v_code == cur_code or cur_code.startswith(v_code)):
+                    variety_idx = i
+                    break
+        if variety_idx < self._variety_combo.count():
+            self._variety_combo.setCurrentIndex(variety_idx)
+        self._variety_combo.blockSignals(False)
+
+        # 2. 合约下拉框 (基于选中品种生成)
+        selected_variety = self._variety_combo.currentText()
+        contracts: list[str] = []
+        try:
+            contracts = list(data_source.generate_contracts(selected_variety))  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("generate_contracts failed: %s", exc)
+        self._symbol_combo.blockSignals(True)
+        self._symbol_combo.clear()
+        if contracts:
+            self._symbol_combo.addItems(contracts)
+        if current:
+            idx = self._symbol_combo.findText(current)
+            if idx >= 0:
+                self._symbol_combo.setCurrentIndex(idx)
+            elif contracts:
+                self._symbol_combo.setCurrentIndex(0)
+        elif contracts:
+            self._symbol_combo.setCurrentIndex(0)
+        self._symbol_combo.blockSignals(False)
+
+    def _on_variety_combo_changed(self, index: int) -> None:
+        """品种下拉框切换 → 重新生成合约列表."""
+        if getattr(self, "_switching", False):
+            return
+        kind = self._current_data_source_kind()
+        if kind != "eastmoney_futures":
+            return
+        data_source = getattr(self._ctx, "data_source", None)
+        if data_source is None:
+            return
+        variety_text = self._variety_combo.currentText()
+        if not variety_text:
+            return
+        try:
+            contracts = list(data_source.generate_contracts(variety_text))  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("generate_contracts failed: %s", exc)
+            return
+        self._symbol_combo.blockSignals(True)
+        self._symbol_combo.clear()
+        if contracts:
+            self._symbol_combo.addItems(contracts)
+            self._symbol_combo.setCurrentIndex(0)  # 默认主力
+        self._symbol_combo.blockSignals(False)
 
     def _populate_timeframe_combo_for_source(self) -> None:
         data_source = getattr(self._ctx, "data_source", None)
@@ -1709,7 +1816,8 @@ class MainWindow(QMainWindow):
                 flow.set_step_status(0, "done")
                 flow.set_step_caption(0, "已就绪")
 
-        if self._pending_submit_after_close and bars:
+        if self._pending_submit_after_close:
+            # bars 可能为空 (数据拉取失败), forming_bar_has_closed 会用时间判断是否收盘
             self._check_pending_bar_close(bars)
 
         if self._chart_refresh_paused:
@@ -2721,12 +2829,19 @@ class MainWindow(QMainWindow):
         # trigger the switch now before submitting analysis.
         data_source = getattr(self._ctx, "data_source", None)
         if data_source is not None:
-            new_symbol = self._symbol_combo.currentText().strip()
+            new_symbol_raw = self._symbol_combo.currentText().strip()
             new_tf = self._tf_combo.currentText().strip()
+            # 东方财富期货: 下拉框显示 "AO0 主力", 数据源内部存 normalize 后的 "AO0",
+            # 需 normalize 后比较, 否则每次提交都误触发切换导致分析无法启动.
+            if self._current_data_source_kind() == "eastmoney_futures":
+                from pa_agent.data.eastmoney_futures_source import normalize_futures_symbol
+                new_symbol = normalize_futures_symbol(new_symbol_raw)
+            else:
+                new_symbol = new_symbol_raw
             cur_symbol = str(getattr(data_source, "_symbol", "") or "").strip()
             cur_tf = str(getattr(data_source, "_timeframe", "") or "").strip()
             if new_symbol and (new_symbol != cur_symbol or new_tf != cur_tf):
-                self._on_symbol_or_tf_changed(new_symbol, new_tf)
+                self._on_symbol_or_tf_changed(new_symbol_raw, new_tf)
                 # Switch resets everything; user needs to click 提交分析 again
                 # once data arrives.
                 return
